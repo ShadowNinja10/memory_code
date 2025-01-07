@@ -64,6 +64,7 @@ class Actor(nn.Module):
         action=None,
         cluster_centers=None,
         mask=None,
+        video_names=None,
     ):
         B, T, D = obs.shape
         if self._policy_type == "mlp":
@@ -107,7 +108,9 @@ class Actor(nn.Module):
                 base_mask[:, :, -1:] = mask
 
             # get action features
-            features = self._policy(obs, mask=base_mask if mask is not None else None)
+            # features = self._policy(obs, mask=base_mask if mask is not None else None)
+            features = self._policy(obs, mask=base_mask if mask is not None else None, video_names=video_names)
+
             features = features[:, num_prompt_feats:]
             num_feat_per_step = self._num_feat_per_step + 1  # +1 for action token
             features = features[:, num_feat_per_step - 1 :: num_feat_per_step]
@@ -533,6 +536,7 @@ class BCAgent:
         batch = next(expert_replay_iter)
         data = utils.to_torch(batch, self.device)
         action = data["actions"].float()
+        video_names = data["video_name"]  # shape (B,) or list of strings
 
         # features
         features = []
@@ -596,6 +600,7 @@ class BCAgent:
             stddev,
             action,
             mask=None,
+            video_names=video_names,
         )
         if self.train_encoder:
             self.encoder_opt.zero_grad(set_to_none=True)

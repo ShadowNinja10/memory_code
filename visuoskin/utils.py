@@ -11,7 +11,7 @@ from torch import distributions as pyd
 from torch.distributions.utils import _standard_normal
 
 # Set data directory here
-DATA_DIR = ""
+DATA_DIR = "/Users/jayesh/MSCS/RL/data"
 
 
 class eval_mode:
@@ -44,9 +44,18 @@ def soft_update_params(net, target_net, tau):
 
 
 def to_torch(xs, device):
+    # for key, value in xs.items():
+    #     xs[key] = torch.as_tensor(value, device=device)
+    # return xs
     for key, value in xs.items():
-        xs[key] = torch.as_tensor(value, device=device)
+        if isinstance(value[0], str):
+            # keep it as a string, don't convert
+            xs[key] = value
+        else:
+            xs[key] = torch.as_tensor(value, device=device)
+    
     return xs
+
 
 
 def weight_init(m):

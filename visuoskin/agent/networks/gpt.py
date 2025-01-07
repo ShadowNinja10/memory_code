@@ -144,6 +144,177 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MemoryCausalSelfAttention(nn.Module):
+  
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+
+    
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones(config.block_size, config.block_size))
+            .view(1, 1, config.block_size, config.block_size),
+        )
+
+        self.cached_k = []
+        self.cached_v = []
+        self.cached_video_names = []
+        self.max_mem = 4
+
+        kernel_size = 2
+        stride = 2
+        padding = kernel_size // 2
+        self.compress_k = nn.Conv1d(
+            in_channels=self.head_dim,  
+            out_channels=self.head_dim,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=self.head_dim,  
+            bias=False,
+        )
+        self.norm_compress_k = nn.LayerNorm(self.head_dim)
+
+        self.compress_v = nn.Conv1d(
+            in_channels=self.head_dim,
+            out_channels=self.head_dim,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=self.head_dim,
+            bias=False,
+        )
+        self.norm_compress_v = nn.LayerNorm(self.head_dim)
+
+
+        self.enable_compression = True
+
+    def clear_memory(self):
+        """Clear all cached memory (K/V). Useful at new episode / new video."""
+        self.cached_k.clear()
+        self.cached_v.clear()
+        self.cached_video_names.clear()
+
+    def compress_fn(self, k_uncompressed, v_uncompressed):
+        
+        B, nH, T, hdim = k_uncompressed.shape
+
+        k_out = k_uncompressed.reshape(B * nH, T, hdim)
+        k_out = k_out.permute(0, 2, 1)  # (B*nH, hdim, T)
+        k_out = self.compress_k(k_out)  # => (B*nH, hdim, T_compressed)
+        T_compressed = k_out.shape[-1]
+        k_out = k_out.permute(0, 2, 1)  # => (B*nH, Tc, hdim)
+        k_out = self.norm_compress_k(k_out)
+        k_out = k_out.reshape(B, nH, T_compressed, hdim)
+
+        v_out = v_uncompressed.reshape(B * nH, T, hdim)
+        v_out = v_out.permute(0, 2, 1)
+        v_out = self.compress_v(v_out)
+        T_compressed = v_out.shape[-1]
+        v_out = v_out.permute(0, 2, 1)
+        v_out = self.norm_compress_v(v_out)
+        v_out = v_out.reshape(B, nH, T_compressed, hdim)
+
+        return k_out, v_out
+
+    def forward(self, x, attn_mask=None, video_names=None):
+
+
+        B, T, C = x.size()
+
+        qkv = self.c_attn(x)  # => (B, T, 3C)
+        q, k_new, v_new = qkv.split(self.n_embd, dim=2)
+
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)   # => (B, n_head, T, head_dim)
+        k_new = k_new.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v_new = v_new.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+
+        if len(self.cached_video_names) > 0:
+
+            old_vids = self.cached_video_names[-1]
+            if video_names is not None and old_vids is not None:
+                for i in range(B):
+                    if video_names[i] not in old_vids:
+                        self.clear_memory()
+                        break
+
+        if self.enable_compression and len(self.cached_k) > 0:
+
+            k_uncompressed = self.cached_k[-1]
+            v_uncompressed = self.cached_v[-1]
+            k_compressed, v_compressed = self.compress_fn(k_uncompressed, v_uncompressed)
+
+            self.cached_k[-1] = k_compressed.detach()
+            self.cached_v[-1] = v_compressed.detach()
+
+        self.cached_k.append(k_new.detach())
+        self.cached_v.append(v_new.detach())
+
+        self.cached_video_names.append(video_names)
+
+        
+        while len(self.cached_k) > self.max_mem:
+            self.cached_k.pop(0)
+            self.cached_v.pop(0)
+            self.cached_video_names.pop(0)
+
+        
+        all_k = torch.cat(self.cached_k, dim=2)
+        all_v = torch.cat(self.cached_v, dim=2)
+
+
+        att = (q @ all_k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+
+
+        T_mem = all_k.size(2)
+        max_size = self.bias.shape[-1]
+        used_T = min(T, max_size)
+        used_T_mem = min(T_mem, max_size)
+
+        causal_mask = self.bias[:, :, :used_T, :used_T_mem]
+        if used_T < T or used_T_mem < T_mem:
+          
+            att = att[:, :, :used_T, :used_T_mem]
+
+        if attn_mask is not None:
+            
+            attn_mask = attn_mask[:, :, :used_T, :used_T_mem]
+            causal_mask = causal_mask * attn_mask
+
+        att = att.masked_fill(causal_mask == 0, float("-inf"))
+
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att) 
+
+        all_v = all_v[:, :, :used_T_mem, :]
+        y = att @ all_v
+
+        y = y.transpose(1, 2).contiguous().view(B, used_T, C)
+
+        y = self.resid_dropout(self.c_proj(y))
+
+        return y
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -159,16 +330,32 @@ class MLP(nn.Module):
         return x
 
 
+# class Block(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.ln_1 = nn.LayerNorm(config.n_embd)
+#         self.attn = CausalSelfAttention(config)
+#         self.ln_2 = nn.LayerNorm(config.n_embd)
+#         self.mlp = MLP(config)
+
+#     def forward(self, x, mask=None):
+#         x = x + self.attn(self.ln_1(x), attn_mask=mask)
+#         x = x + self.mlp(self.ln_2(x))
+#         return x
+
+
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
+        
+        self.attn = MemoryCausalSelfAttention(config)
+
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
-
-    def forward(self, x, mask=None):
-        x = x + self.attn(self.ln_1(x), attn_mask=mask)
+    
+    def forward(self, x, mask=None, video_names=None):
+        x = x + self.attn(self.ln_1(x), attn_mask=mask, video_names=video_names)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -214,7 +401,7 @@ class GPT(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         print("number of parameters: %.2fM" % (n_params / 1e6,))
 
-    def forward(self, input, targets=None, mask=None):
+    def forward(self, input, targets=None, mask=None,video_names=None):
         device = input.device
         b, t, d = input.size()
         assert (
@@ -233,7 +420,8 @@ class GPT(nn.Module):
         )  # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x, mask=mask)
+            
+            x = block(x, mask=mask,video_names=video_names)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         return logits

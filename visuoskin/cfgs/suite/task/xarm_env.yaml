@@ -4,4 +4,4 @@ defaults:
 suite: xarm_env
 tasks:
   # - 0529_norot_ballincup #y
-  - 0802_insert_plug_triangle
+  - 0824_card_swipe

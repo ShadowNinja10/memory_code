@@ -70,11 +70,7 @@ def get_absolute_action(rel_actions, base_action):
     actions = np.zeros((len(rel_actions) + 1, rel_actions.shape[-1]))
     actions[0] = base_action
     for i in range(1, len(rel_actions) + 1):
-        # if i == 0:
-        #     actions.append(base_action)
-        #     continue
-        # Get relative transformation matrix
-        # previous pose
+
         pos_prev = actions[i - 1, :3]
         ori_prev = actions[i - 1, 3:6]
         r_prev = R.from_rotvec(ori_prev).as_matrix()
@@ -109,6 +105,9 @@ def get_quaternion_orientation(cartesian):
         quat = R.from_rotvec(ori).as_quat()
         new_cartesian.append(np.concatenate([pos, quat], axis=-1))
     return np.array(new_cartesian, dtype=np.float32)
+
+
+
 
 
 class BCDataset(IterableDataset):
@@ -353,13 +352,12 @@ class BCDataset(IterableDataset):
                 max_stat = np.maximum(max_stat, max_val)
                 min_stat = np.minimum(min_stat, min_val)
             if use_anyskin_data:
-                # If baseline is subtracted, use zero as shift and max as scale
+
                 if self._subtract_sensor_baseline:
                     max_sensor_stat = np.maximum(
                         np.abs(max_sensor_stat), np.abs(min_sensor_stat)
                     )
                     min_sensor_stat = np.zeros_like(max_sensor_stat)
-                # If baseline isn't subtracted, use usual min and max values
                 else:
                     if max_sensor_stat is None:
                         max_sensor_stat = data["max_sensor"]
@@ -443,7 +441,7 @@ class BCDataset(IterableDataset):
                     transforms.ToTensor(),
                 ]
             )
-        # augmentation
+
         self.aug = transforms.Compose(
             [
                 transforms.ToPILImage(),
@@ -453,10 +451,28 @@ class BCDataset(IterableDataset):
             ]
         )
 
-        # Samples from envs
+
         self.envs_till_idx = len(self._episodes)
 
         self.prob = np.array(self.prob) / np.sum(self.prob)
+
+
+        self._videos = []  
+        video_counter = 0
+        for path_idx, ep_list in self._episodes.items():
+            for i, ep in enumerate(ep_list):
+    
+                if "video_name" not in ep:
+                    ep["video_name"] = f"vid_{video_counter}"
+                video_counter += 1
+
+                ep["pointer"] = 1
+
+                self._videos.append(ep)
+
+        self.num_videos = len(self._videos)
+
+        self.video_idx = 0 
 
     def preprocess(self, key, x):
         if key.startswith("digit"):
@@ -467,40 +483,45 @@ class BCDataset(IterableDataset):
             self.stats[key]["max"] - self.stats[key]["min"] + 1e-5
         )
 
-    def _sample_episode(self, env_idx=None):
-        idx = random.randint(0, self.envs_till_idx - 1) if env_idx is None else env_idx
+    def _sample_episode(self, video_idx):
+        
 
-        # sample idx with probability
-        idx = np.random.choice(list(self._episodes.keys()), p=self.prob)
+        episode_info = self._all_episodes_list[video_idx]
+        env_idx = episode_info["env_idx"]
+        ep_idx = episode_info["ep_idx"]
+        return self._episodes[env_idx][ep_idx], episode_info
 
-        episode = random.choice(self._episodes[idx])
-        return (episode, idx) if env_idx is None else episode
 
-    def _sample(self):
-        episodes, env_idx = self._sample_episode()
-        observations = episodes["observation"]
-        actions = episodes["action"]
-        sample_idx = np.random.randint(1, len(observations[self._pixel_keys[0]]) - 1)
-        # Sample obs, action
+    def _sample(self, video):
+        
+        observations = video["observation"]
+        actions = video["action"]
+        sample_idx = video["pointer"]
+
+        
+        video["pointer"] += 1
+
+        obs_len = len(observations[self._pixel_keys[0]])
+        if video["pointer"] >= obs_len:
+        
+            video["pointer"] = 1  
+
+        neg_start = -(sample_idx + 1)
+        neg_end = -sample_idx if sample_idx != 0 else None
+
         sampled_pixel = {}
         for key in self._pixel_keys:
-            sampled_pixel[key] = observations[key][-(sample_idx + 1) : -sample_idx]
-            sampled_pixel[key] = torch.stack(
-                [
-                    self.aug(sampled_pixel[key][i])
-                    for i in range(len(sampled_pixel[key]))
-                ]
+            sample_slice = observations[key][neg_start:neg_end]
+            sample_slice = torch.stack(
+                [self.aug(sample_slice[i]) for i in range(len(sample_slice))]
             )
-            sampled_state = {}
-            sampled_state = {}
+            sampled_pixel[key] = sample_slice
 
         sampled_state = {}
         sampled_state["proprioceptive"] = np.concatenate(
             [
-                observations["cartesian_states"][-(sample_idx + 1) : -sample_idx],
-                observations["gripper_states"][-(sample_idx + 1) : -sample_idx][
-                    :, None
-                ],
+                observations["cartesian_states"][neg_start:neg_end],
+                observations["gripper_states"][neg_start:neg_end][:, None],
             ],
             axis=1,
         )
@@ -510,39 +531,32 @@ class BCDataset(IterableDataset):
                 np.ones_like(sampled_state["proprioceptive"])
                 * self.stats["proprioceptive"]["min"]
             )
+
         if self._sensor_type == "reskin":
             try:
                 for sensor_idx in range(self._num_anyskin_sensors):
                     skey = f"sensor{sensor_idx}"
-                    sampled_state[f"{skey}"] = observations[f"{skey}_states"][
-                        -(sample_idx + 1) : -sample_idx
-                    ]
+                    sampled_state[skey] = observations[f"{skey}_states"][neg_start:neg_end]
             except KeyError:
                 pass
         elif self._sensor_type == "digit":
             try:
                 for sensor_idx in range(self._num_anyskin_sensors):
-                    key = f"digit{80 + sensor_idx}"
-                    sampled_state[key] = observations[key][
-                        -(sample_idx + 1) : -sample_idx
-                    ]
-                    sampled_state[key] = torch.stack(
-                        [
-                            self.digit_aug(sampled_state[key][i])
-                            # self.aug(sampled_state[key][i])
-                            for i in range(len(sampled_state[key]))
-                        ]
+                    dkey = f"digit{80 + sensor_idx}"
+                    sample_slice = observations[dkey][neg_start:neg_end]
+                    sample_slice = torch.stack(
+                        [self.digit_aug(sample_slice[i]) for i in range(len(sample_slice))]
                     )
+                    sampled_state[dkey] = sample_slice
             except KeyError as e:
                 pass
 
         if self._temporal_agg:
-            # arrange sampled action to be of shape (1, num_queries, action_dim)
             sampled_action = np.zeros((1, self._num_queries, actions.shape[-1]))
             num_actions = 1 + self._num_queries - 1
             act = np.zeros((num_actions, actions.shape[-1]))
             if num_actions - sample_idx < 0:
-                act[:num_actions] = actions[-(sample_idx) : -sample_idx + num_actions]
+                act[:num_actions] = actions[-sample_idx : -sample_idx + num_actions]
             else:
                 act[:sample_idx] = actions[-sample_idx:]
                 act[sample_idx:] = actions[-1]
@@ -551,21 +565,40 @@ class BCDataset(IterableDataset):
             )
             sampled_action = sampled_action[:, 0]
         else:
-            sampled_action = actions[-(sample_idx + 1) : -sample_idx]
+            sampled_action = actions[neg_start:neg_end]
 
         return_dict = {}
-        for key in self._pixel_keys:
-            return_dict[key] = sampled_pixel[key]
-        for key in self._aux_keys:
-            return_dict[key] = self.preprocess(key, sampled_state[key])
-            return_dict["actions"] = self.preprocess("actions", sampled_action)
-            return_dict["actions"] = self.preprocess("actions", sampled_action)
+        for k in self._pixel_keys:
+            return_dict[k] = sampled_pixel[k]
+
+        for k in self._aux_keys:
+            if k in sampled_state:
+                return_dict[k] = self.preprocess(k, sampled_state[k])
+
         return_dict["actions"] = self.preprocess("actions", sampled_action)
+
+        return_dict["video_name"] = video["video_name"]
+
         return return_dict
 
+
+
     def __iter__(self):
+   
         while True:
-            yield self._sample()
+
+            if self.num_videos == 0:
+                break
+
+            video = self._videos[self.video_idx]
+
+            sample_dict = self._sample(video)
+
+            yield sample_dict
+
+
+            self.video_idx = (self.video_idx + 1) % self.num_videos
+
 
     def __len__(self):
         return self._num_samples
